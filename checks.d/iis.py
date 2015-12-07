@@ -1,12 +1,16 @@
 '''
 Check the performance counters from IIS
 '''
+#stdlib
+from collections import namedtuple
+
 # 3rd party
 import wmi
 
 # project
 from checks import AgentCheck
 
+WMIMetric = namedtuple('WMIMetric', ['name', 'value', 'tags'])
 
 class IIS(AgentCheck):
     METRICS = [
@@ -44,6 +48,9 @@ class IIS(AgentCheck):
     ]
     SERVICE_CHECK = "iis.site_up"
 
+    NAMESPACE = "root\\CIMV2"
+    CLASS = "Win32_PerfFormattedData_W3SVC_WebService"
+
     def __init__(self, name, init_config, agentConfig, instances):
         AgentCheck.__init__(self, name, init_config, agentConfig, instances)
         self.wmi_conns = {}
@@ -61,54 +68,98 @@ class IIS(AgentCheck):
         password = instance.get('password', None)
         instance_tags = instance.get('tags', [])
         sites = instance.get('sites', ['_Total'])
-        w = self._get_wmi_conn(host, user, password)
 
-        try:
-            wmi_cls = w.Win32_PerfFormattedData_W3SVC_WebService()
-            if not wmi_cls:
-                raise Exception('Missing data from Win32_PerfFormattedData_W3SVC_WebService')
-        except Exception:
-            self.log.exception('Unable to fetch Win32_PerfFormattedData_W3SVC_WebService class')
-            return
+        instance_key = "{host}:{namespace}:{class}".format(host, self.NAMESPACE, self.CLASS)
+        properties = map(lambda x: x[2], self.METRICS)
+        metrics_by_property = {}
+        for metric, metric_type, prop in self.METRICS:
+            metrics_by_property[prop] = (metric, metric_type)
 
-        expected_sites = set(sites)
-        # Iterate over every IIS site
-        for iis_site in wmi_cls:
+        wmi_sampler = self._get_wmi_sampler(
+            instance_key,
+            self.CLASS, properties,
+            filters=None,
+            host=host, namespace=self.NAMESPACE,
+            username=user, password=password
+        )
+
+        # Sample, extract & submit metrics
+        wmi_sampler.sample()
+
+        metrics = self._extract_metrics(wmi_sampler, instance_tags)
+
+        self._submit_events(wmi_sampler, sites)
+        self._submit_metrics(metrics, metrics_by_property)
+
+    def _extract_metrics(self, wmi_sampler, sites, tags):
+        """
+        Extract and tag metrics from the WMISampler.
+
+        Returns: List of WMIMetric
+        ```
+        [
+            WMIMetric("freemegabytes", 19742, ["name:_total"]),
+            WMIMetric("avgdiskbytesperwrite", 1536, ["name:c:"]),
+        ]
+        ```
+        """
+        metrics = []
+
+        for wmi_obj in wmi_sampler:
+            tags = list(tags) if tags else []
+
+            # get site name
+            sitename = wmi_obj['Name']
+
             # Skip any sites we don't specifically want.
-            if iis_site.Name not in sites:
+            if sitename not in sites:
+                continue
+            elif sitename != "_Total":
+                tags.append(sitename)
+
+            # Tag with `tag_queries` parameter
+            for wmi_property, wmi_value in wmi_obj.iteritems():
+                # Tag with `tag_by` parameter
+                try:
+                    metrics.append(WMIMetric(wmi_property, float(wmi_value), tags + [sitename]))
+                except ValueError:
+                    self.log.warning(u"When extracting metrics with WMI, found a non digit value"
+                                     " for property '{0}'.".format(wmi_property))
+                    continue
+                except TypeError:
+                    self.log.warning(u"When extracting metrics with WMI, found a missing property"
+                                     " '{0}'".format(wmi_property))
+                    continue
+        return metrics
+
+    def _submit_events(self, wmi_sampler, sites):
+        expected_sites = set(sites)
+
+        for wmi_obj in wmi_sampler:
+            sitename = wmi_obj['Name']
+            if sitename == "_Total":
                 continue
 
-            # Tag with the site name if we're not using the aggregate
-            if iis_site.Name != '_Total':
-                tags = instance_tags + ['site:%s' % iis_site.Name]
-            else:
-                tags = instance_tags
+            uptime = wmi_obj["ServiceUptime"]
+            if uptime == 0:
+                status = AgentCheck.CRITICAL if uptime == 0 else AgentCheck.OK
 
-            status = AgentCheck.CRITICAL if iis_site.ServiceUptime == 0 else AgentCheck.OK
-            self.service_check("iis.site_up", status, tags=['site:%s' % iis_site.Name])
-            expected_sites.remove(iis_site.Name)
+            self.service_check("iis.site_up", status, tags=['site:%s' % sitename])
+            expected_sites.remove(sitename)
 
-            for metric, mtype, wmi_val in self.METRICS:
-                if not hasattr(iis_site, wmi_val):
-                    if wmi_val == 'TotalBytesTransferred' and hasattr(iis_site,
-                                                                      'TotalBytesTransfered'):
-                        # Windows 2008 sp2 reports it as TotalbytesTransfered
-                        # instead of TotalBytesTransferred (single r)
-                        wmi_val = 'TotalBytesTransfered'
-                    elif wmi_val == 'TotalConnectionAttemptsAllInstances' \
-                            and hasattr(iis_site, 'TotalConnectionAttemptsallinstances'):
-                        wmi_val = 'TotalConnectionAttemptsallinstances'
-                    else:
-                        self.warning("Unable to fetch metric %s. Missing %s in "
-                                     "Win32_PerfFormattedData_W3SVC_WebService"
-                                     % (metric, wmi_val))
-                        continue
+        for site in expected_sites:
+            self.service_check("iis.site_up", AgentCheck.CRITICAL, tags=['site:%s' % site])
 
-                # Submit the metric value with the correct type
-                value = float(getattr(iis_site, wmi_val))
-                metric_func = getattr(self, mtype)
-                metric_func(metric, value, tags=tags)
 
-        for remaining_site in expected_sites:
-            self.service_check("iis.site_up", AgentCheck.CRITICAL,
-                               tags=['site:%s' % remaining_site])
+    def _submit_metrics(self, wmi_metrics, metrics_by_property):
+        for m in wmi_metrics:
+            if m.name == "TotalBytesTransfered":
+                m.name = "TotalBytesTransferred"
+            elif m.name == "TotalConnectionAttemptsallinstances":
+                m.name = "TotalConnectionAttemptsAllinstances"
+            elif m.name not in metrics_by_property:
+                continue
+
+            metric, mtype = metrics_by_property[m.name]
+            submittor = self.getattr(mtype)
+            submittor(metric, m.value, m.tags)
